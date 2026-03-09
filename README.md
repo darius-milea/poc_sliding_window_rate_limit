@@ -21,6 +21,8 @@ Redis-first Node.js + TypeScript proof-of-concept for enforcing mailbox/API limi
 ## Project layout
 
 - `src/RedisRateLimitEngine.ts`: distributed Redis-backed limiter
+- `src/lua/evaluateAndCommit.lua`: fully atomic check+commit decision script (heavily commented)
+- `src/lua/releaseConcurrency.lua`: atomic permit release script (heavily commented)
 - `src/limits.ts`: shared numeric limits/windows
 - `src/types.ts`: request and decision contracts
 - `src/demo.ts`: Redis-backed runnable demo
@@ -64,5 +66,6 @@ For mailbox `mailbox-42` and prefix `rl:poc`:
 ## Notes
 
 - This is still a POC.
-- Lua is intentionally minimal (atomic acquire/release only).
+- Decision checks + state commit are atomic in `src/lua/evaluateAndCommit.lua`.
+- `src/lua/releaseConcurrency.lua` handles atomic permit release.
 - Tests do not need a live Redis instance; the demo does.

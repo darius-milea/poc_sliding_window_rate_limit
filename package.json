@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "commonjs",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && mkdir -p dist/src/lua && cp src/lua/*.lua dist/src/lua/",
     "start": "node dist/src/demo.js",
     "test": "npm run build && node --test dist/test"
   },

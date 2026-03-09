@@ -6,7 +6,7 @@ const MB = 1024 * 1024;
 
 class FakeRedisClient implements RedisClientLike {
   private readonly strings = new Map<string, string>();
-  private readonly zsets = new Map<string, Map<string, number>>();
+  private readonly zsets = new Map<string, Array<{ score: number; member: string }>>();
 
   public async eval(
     script: string,
@@ -15,117 +15,194 @@ class FakeRedisClient implements RedisClientLike {
       arguments: string[];
     }
   ): Promise<unknown> {
-    const key = options.keys[0];
-
-    // Acquire script call shape: [limit, leaseMs]
-    if (options.arguments.length === 2 && script.includes("current >= limit")) {
-      const limit = Number(options.arguments[0]);
-      const current = Number(this.strings.get(key) ?? "0");
-      if (current >= limit) {
-        return 0;
-      }
-
-      const next = current + 1;
-      this.strings.set(key, String(next));
-      return next;
+    if (script.includes("releaseConcurrency.lua") || script.includes("local leaseMs = tonumber(ARGV[1])")) {
+      return this.releaseConcurrency(options.keys[0]);
     }
 
-    // Release script call shape: [leaseMs]
-    if (options.arguments.length === 1 && script.includes("DECR")) {
-      const current = Number(this.strings.get(key) ?? "0");
-      if (current <= 0) {
-        return 0;
-      }
-
-      if (current === 1) {
-        this.strings.delete(key);
-        return 0;
-      }
-
-      const next = current - 1;
-      this.strings.set(key, String(next));
-      return next;
-    }
-
-    throw new Error("Unsupported fake eval invocation");
+    return this.evaluateAndCommit(options.keys, options.arguments);
   }
 
-  public async zRemRangeByScore(key: string, min: number, max: number): Promise<number> {
-    const zset = this.zsets.get(key);
-    if (!zset) {
+  private releaseConcurrency(key: string): number {
+    const current = Number(this.strings.get(key) ?? "0");
+    if (current <= 0) {
       return 0;
     }
 
-    let removed = 0;
-    for (const [member, score] of zset.entries()) {
-      if (score >= min && score <= max) {
-        zset.delete(member);
-        removed += 1;
+    if (current === 1) {
+      this.strings.delete(key);
+      return 0;
+    }
+
+    const next = current - 1;
+    this.strings.set(key, String(next));
+    return next;
+  }
+
+  private evaluateAndCommit(keys: string[], args: string[]): [number, string, number] {
+    const [kGlobal, kAppUser, kMailboxMsg, kMailboxRecipients, kMailboxUpload, kPenalty, kConcurrency] = keys;
+
+    const nowMs = Number(args[0]);
+    const kind = args[1];
+    const recipientCount = Number(args[2]);
+    const payloadBytes = Number(args[3]);
+    const attachmentBytes = Number(args[4]);
+    const uploadSessionCreatedAtMs = Number(args[5]);
+    const allowUpTo1000 = Number(args[6]);
+    const requestId = args[7];
+
+    const globalLimit = Number(args[8]);
+    const globalWindowMs = Number(args[9]);
+    const appUserLimit = Number(args[10]);
+    const appUserWindowMs = Number(args[11]);
+    const mailboxMsgLimit = Number(args[12]);
+    const mailboxMsgWindowMs = Number(args[13]);
+    const mailboxRecipientsLimit = Number(args[14]);
+    const mailboxRecipientsWindowMs = Number(args[15]);
+    const mailboxUploadLimit = Number(args[16]);
+    const mailboxUploadWindowMs = Number(args[17]);
+    const payloadBytesPerMessageLimit = Number(args[18]);
+    const payloadBytesLargeBatchLimit = Number(args[19]);
+    const recipientCapDefault = Number(args[20]);
+    const recipientCapOverride = Number(args[21]);
+    const recipientPenaltyWindowMs = Number(args[22]);
+    const uploadSessionLifetimeMs = Number(args[23]);
+    const mailboxConcurrencyLimit = Number(args[24]);
+
+    const reject = (reason: string, retryAfterMs: number): [number, string, number] => [0, reason, retryAfterMs];
+
+    if (recipientCount < 0 || payloadBytes < 0 || attachmentBytes < 0) {
+      return reject("negative_values_not_allowed", 0);
+    }
+
+    if (kind === "sendMessage") {
+      const recipientCap = allowUpTo1000 === 1 ? recipientCapOverride : recipientCapDefault;
+
+      if (recipientCount > recipientCap) {
+        return reject("recipient_count_exceeds_per_message_cap", 0);
+      }
+
+      if (payloadBytes > payloadBytesPerMessageLimit) {
+        return reject("payload_too_large_for_message", 0);
+      }
+
+      if (recipientCount > recipientCapDefault && payloadBytes > payloadBytesLargeBatchLimit) {
+        return reject("payload_too_large_for_large_recipient_batch", 0);
+      }
+
+      const penaltyUntil = Number(this.strings.get(kPenalty) ?? "0");
+      if (penaltyUntil > nowMs) {
+        return reject("recipient_daily_limit_penalty_active", penaltyUntil - nowMs);
+      }
+
+      this.pruneWindow(kMailboxMsg, nowMs - mailboxMsgWindowMs);
+      if (this.zCard(kMailboxMsg) + 1 > mailboxMsgLimit) {
+        return reject(
+          "mailbox_message_rate_exceeded",
+          this.retryAfterWindow(kMailboxMsg, mailboxMsgWindowMs, nowMs)
+        );
+      }
+
+      if (recipientCount > 0) {
+        this.pruneWindow(kMailboxRecipients, nowMs - mailboxRecipientsWindowMs);
+        if (this.sumAmountMembers(kMailboxRecipients) + recipientCount > mailboxRecipientsLimit) {
+          this.strings.set(kPenalty, String(nowMs + recipientPenaltyWindowMs));
+          return reject("mailbox_recipient_daily_limit_exceeded_penalty_started", recipientPenaltyWindowMs);
+        }
       }
     }
 
-    return removed;
-  }
+    if (kind === "uploadAttachment") {
+      if (uploadSessionCreatedAtMs >= 0 && nowMs - uploadSessionCreatedAtMs > uploadSessionLifetimeMs) {
+        return reject("upload_session_expired", 0);
+      }
 
-  public async zCard(key: string): Promise<number> {
-    return this.zsets.get(key)?.size ?? 0;
-  }
-
-  public async zRangeWithScores(key: string, start: number, stop: number): Promise<Array<{ value: string; score: number }>> {
-    const sorted = this.getSortedEntries(key);
-    return this.sliceRange(sorted, start, stop).map((entry) => ({ value: entry.member, score: entry.score }));
-  }
-
-  public async zRange(key: string, start: number, stop: number): Promise<string[]> {
-    const sorted = this.getSortedEntries(key);
-    return this.sliceRange(sorted, start, stop).map((entry) => entry.member);
-  }
-
-  public async zAdd(key: string, members: Array<{ score: number; value: string }>): Promise<number> {
-    let zset = this.zsets.get(key);
-    if (!zset) {
-      zset = new Map<string, number>();
-      this.zsets.set(key, zset);
+      this.pruneWindow(kMailboxUpload, nowMs - mailboxUploadWindowMs);
+      if (this.sumAmountMembers(kMailboxUpload) + attachmentBytes > mailboxUploadLimit) {
+        return reject(
+          "mailbox_upload_bandwidth_exceeded",
+          this.retryAfterWindow(kMailboxUpload, mailboxUploadWindowMs, nowMs)
+        );
+      }
     }
 
-    for (const member of members) {
-      zset.set(member.value, member.score);
+    this.pruneWindow(kGlobal, nowMs - globalWindowMs);
+    if (this.zCard(kGlobal) + 1 > globalLimit) {
+      return reject("global_request_rate_exceeded", this.retryAfterWindow(kGlobal, globalWindowMs, nowMs));
     }
 
-    return members.length;
-  }
-
-  public async pExpire(_key: string, _milliseconds: number): Promise<number> {
-    return 1;
-  }
-
-  public async get(key: string): Promise<string | null> {
-    return this.strings.get(key) ?? null;
-  }
-
-  public async set(key: string, value: string): Promise<string | null> {
-    this.strings.set(key, value);
-    return "OK";
-  }
-
-  private getSortedEntries(key: string): Array<{ member: string; score: number }> {
-    const zset = this.zsets.get(key);
-    if (!zset) {
-      return [];
+    this.pruneWindow(kAppUser, nowMs - appUserWindowMs);
+    if (this.zCard(kAppUser) + 1 > appUserLimit) {
+      return reject("app_user_request_rate_exceeded", this.retryAfterWindow(kAppUser, appUserWindowMs, nowMs));
     }
 
-    return Array.from(zset.entries())
-      .map(([member, score]) => ({ member, score }))
-      .sort((a, b) => a.score - b.score || a.member.localeCompare(b.member));
-  }
+    const inFlight = Number(this.strings.get(kConcurrency) ?? "0");
+    if (inFlight >= mailboxConcurrencyLimit) {
+      return reject("mailbox_concurrency_exceeded", 0);
+    }
+    this.strings.set(kConcurrency, String(inFlight + 1));
 
-  private sliceRange<T>(values: T[], start: number, stop: number): T[] {
-    const normalizedStop = stop < 0 ? values.length - 1 : stop;
-    if (values.length === 0 || start > normalizedStop) {
-      return [];
+    const countMember = `${nowMs}:${requestId}`;
+    this.zAdd(kGlobal, nowMs, countMember);
+    this.zAdd(kAppUser, nowMs, countMember);
+
+    if (kind === "sendMessage") {
+      this.zAdd(kMailboxMsg, nowMs, countMember);
+      if (recipientCount > 0) {
+        this.zAdd(kMailboxRecipients, nowMs, `${nowMs}:${requestId}:${recipientCount}`);
+      }
     }
 
-    return values.slice(start, normalizedStop + 1);
+    if (kind === "uploadAttachment" && attachmentBytes > 0) {
+      this.zAdd(kMailboxUpload, nowMs, `${nowMs}:${requestId}:${attachmentBytes}`);
+    }
+
+    return [1, "accepted", 0];
+  }
+
+  private zAdd(key: string, score: number, member: string): void {
+    const zset = this.zsets.get(key) ?? [];
+    const filtered = zset.filter((item) => item.member !== member);
+    filtered.push({ score, member });
+    this.zsets.set(key, filtered);
+  }
+
+  private zCard(key: string): number {
+    return this.zsets.get(key)?.length ?? 0;
+  }
+
+  private pruneWindow(key: string, minScore: number): void {
+    const zset = this.zsets.get(key) ?? [];
+    this.zsets.set(
+      key,
+      zset.filter((item) => item.score > minScore)
+    );
+  }
+
+  private retryAfterWindow(key: string, windowMs: number, nowMs: number): number {
+    const zset = this.zsets.get(key) ?? [];
+    if (zset.length === 0) {
+      return 0;
+    }
+
+    const oldest = zset.reduce((acc, item) => (item.score < acc.score ? item : acc));
+    return Math.max(oldest.score + windowMs - nowMs, 0);
+  }
+
+  private sumAmountMembers(key: string): number {
+    const zset = this.zsets.get(key) ?? [];
+    let total = 0;
+
+    for (const item of zset) {
+      const idx = item.member.lastIndexOf(":");
+      if (idx > -1) {
+        const amount = Number(item.member.slice(idx + 1));
+        if (Number.isFinite(amount)) {
+          total += amount;
+        }
+      }
+    }
+
+    return total;
   }
 }
 
