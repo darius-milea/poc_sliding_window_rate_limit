@@ -1,0 +1,20 @@
+{
+  "name": "poc-sliding-window-rate-limit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "POC rate limiting and concurrency control for mailbox-centric workloads",
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/demo.js",
+    "test": "npm run build && node --test dist/test"
+  },
+  "dependencies": {
+    "redis": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  }
+}
