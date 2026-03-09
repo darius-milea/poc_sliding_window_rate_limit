@@ -1,34 +1,170 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RateLimitEngine } from "../src/RateLimitEngine";
+import { RedisClientLike, RedisRateLimitEngine } from "../src/RedisRateLimitEngine";
 
 const MB = 1024 * 1024;
 
-test("allows four concurrent requests per mailbox and blocks the fifth", () => {
-  const engine = new RateLimitEngine();
+class FakeRedisClient implements RedisClientLike {
+  private readonly strings = new Map<string, string>();
+  private readonly zsets = new Map<string, Map<string, number>>();
 
-  const decisions = Array.from({ length: 5 }, () =>
-    engine.evaluate({
-      appId: "app",
-      userId: "user",
-      mailboxId: "mailbox-1",
-      kind: "outlookApi"
-    })
+  public async eval(
+    script: string,
+    options: {
+      keys: string[];
+      arguments: string[];
+    }
+  ): Promise<unknown> {
+    const key = options.keys[0];
+
+    // Acquire script call shape: [limit, leaseMs]
+    if (options.arguments.length === 2 && script.includes("current >= limit")) {
+      const limit = Number(options.arguments[0]);
+      const current = Number(this.strings.get(key) ?? "0");
+      if (current >= limit) {
+        return 0;
+      }
+
+      const next = current + 1;
+      this.strings.set(key, String(next));
+      return next;
+    }
+
+    // Release script call shape: [leaseMs]
+    if (options.arguments.length === 1 && script.includes("DECR")) {
+      const current = Number(this.strings.get(key) ?? "0");
+      if (current <= 0) {
+        return 0;
+      }
+
+      if (current === 1) {
+        this.strings.delete(key);
+        return 0;
+      }
+
+      const next = current - 1;
+      this.strings.set(key, String(next));
+      return next;
+    }
+
+    throw new Error("Unsupported fake eval invocation");
+  }
+
+  public async zRemRangeByScore(key: string, min: number, max: number): Promise<number> {
+    const zset = this.zsets.get(key);
+    if (!zset) {
+      return 0;
+    }
+
+    let removed = 0;
+    for (const [member, score] of zset.entries()) {
+      if (score >= min && score <= max) {
+        zset.delete(member);
+        removed += 1;
+      }
+    }
+
+    return removed;
+  }
+
+  public async zCard(key: string): Promise<number> {
+    return this.zsets.get(key)?.size ?? 0;
+  }
+
+  public async zRangeWithScores(key: string, start: number, stop: number): Promise<Array<{ value: string; score: number }>> {
+    const sorted = this.getSortedEntries(key);
+    return this.sliceRange(sorted, start, stop).map((entry) => ({ value: entry.member, score: entry.score }));
+  }
+
+  public async zRange(key: string, start: number, stop: number): Promise<string[]> {
+    const sorted = this.getSortedEntries(key);
+    return this.sliceRange(sorted, start, stop).map((entry) => entry.member);
+  }
+
+  public async zAdd(key: string, members: Array<{ score: number; value: string }>): Promise<number> {
+    let zset = this.zsets.get(key);
+    if (!zset) {
+      zset = new Map<string, number>();
+      this.zsets.set(key, zset);
+    }
+
+    for (const member of members) {
+      zset.set(member.value, member.score);
+    }
+
+    return members.length;
+  }
+
+  public async pExpire(_key: string, _milliseconds: number): Promise<number> {
+    return 1;
+  }
+
+  public async get(key: string): Promise<string | null> {
+    return this.strings.get(key) ?? null;
+  }
+
+  public async set(key: string, value: string): Promise<string | null> {
+    this.strings.set(key, value);
+    return "OK";
+  }
+
+  private getSortedEntries(key: string): Array<{ member: string; score: number }> {
+    const zset = this.zsets.get(key);
+    if (!zset) {
+      return [];
+    }
+
+    return Array.from(zset.entries())
+      .map(([member, score]) => ({ member, score }))
+      .sort((a, b) => a.score - b.score || a.member.localeCompare(b.member));
+  }
+
+  private sliceRange<T>(values: T[], start: number, stop: number): T[] {
+    const normalizedStop = stop < 0 ? values.length - 1 : stop;
+    if (values.length === 0 || start > normalizedStop) {
+      return [];
+    }
+
+    return values.slice(start, normalizedStop + 1);
+  }
+}
+
+function createEngine(allowUpTo1000RecipientsPerMessage = false): RedisRateLimitEngine {
+  return new RedisRateLimitEngine(new FakeRedisClient(), {
+    redisKeyPrefix: `rl:test:${Math.random().toString(36).slice(2)}`,
+    allowUpTo1000RecipientsPerMessage
+  });
+}
+
+test("allows four concurrent requests per mailbox and blocks the fifth", async () => {
+  const engine = createEngine();
+
+  const decisions = await Promise.all(
+    Array.from({ length: 5 }, () =>
+      engine.evaluate({
+        appId: "app",
+        userId: "user",
+        mailboxId: "mailbox-1",
+        kind: "outlookApi"
+      })
+    )
   );
 
   assert.equal(decisions.slice(0, 4).every((d) => d.allowed), true);
   assert.equal(decisions[4].allowed, false);
   assert.equal(decisions[4].reason, "mailbox_concurrency_exceeded");
 
-  decisions.forEach((d) => d.releaseConcurrency?.());
+  for (const decision of decisions) {
+    await decision.releaseConcurrency?.();
+  }
 });
 
-test("enforces 30 messages per minute per mailbox", () => {
-  const engine = new RateLimitEngine();
+test("enforces 30 messages per minute per mailbox", async () => {
+  const engine = createEngine();
   const t0 = 1_000;
 
   for (let i = 0; i < 30; i += 1) {
-    const allowed = engine.evaluate({
+    const allowed = await engine.evaluate({
       appId: "app",
       userId: "user",
       mailboxId: "mailbox-2",
@@ -39,10 +175,10 @@ test("enforces 30 messages per minute per mailbox", () => {
     });
 
     assert.equal(allowed.allowed, true);
-    allowed.releaseConcurrency?.();
+    await allowed.releaseConcurrency?.();
   }
 
-  const blocked = engine.evaluate({
+  const blocked = await engine.evaluate({
     appId: "app",
     userId: "user",
     mailboxId: "mailbox-2",
@@ -56,13 +192,12 @@ test("enforces 30 messages per minute per mailbox", () => {
   assert.equal(blocked.reason, "mailbox_message_rate_exceeded");
 });
 
-test("starts 24h penalty when daily recipient budget is exceeded", () => {
-  const engine = new RateLimitEngine({ allowUpTo1000RecipientsPerMessage: true });
+test("starts 24h penalty when daily recipient budget is exceeded", async () => {
+  const engine = createEngine(true);
   const t0 = 10_000;
 
-  // Fill exactly 10,000 recipients with 10 valid batches of 1,000.
   for (let i = 0; i < 10; i += 1) {
-    const decision = engine.evaluate({
+    const decision = await engine.evaluate({
       appId: "app",
       userId: "user",
       mailboxId: "mailbox-3",
@@ -73,10 +208,10 @@ test("starts 24h penalty when daily recipient budget is exceeded", () => {
     });
 
     assert.equal(decision.allowed, true);
-    decision.releaseConcurrency?.();
+    await decision.releaseConcurrency?.();
   }
 
-  const exceeding = engine.evaluate({
+  const exceeding = await engine.evaluate({
     appId: "app",
     userId: "user",
     mailboxId: "mailbox-3",
@@ -89,7 +224,7 @@ test("starts 24h penalty when daily recipient budget is exceeded", () => {
   assert.equal(exceeding.allowed, false);
   assert.equal(exceeding.reason, "mailbox_recipient_daily_limit_exceeded_penalty_started");
 
-  const penaltyActive = engine.evaluate({
+  const penaltyActive = await engine.evaluate({
     appId: "app",
     userId: "user",
     mailboxId: "mailbox-3",
@@ -104,12 +239,12 @@ test("starts 24h penalty when daily recipient budget is exceeded", () => {
   assert.ok(penaltyActive.retryAfterMs > 0);
 });
 
-test("limits app+user independently from other users", () => {
-  const engine = new RateLimitEngine();
+test("limits app+user independently from other users", async () => {
+  const engine = createEngine();
   const t0 = 50_000;
 
   for (let i = 0; i < 10_000; i += 1) {
-    const d = engine.evaluate({
+    const d = await engine.evaluate({
       appId: "app-x",
       userId: "user-1",
       mailboxId: `mailbox-${i}`,
@@ -118,10 +253,10 @@ test("limits app+user independently from other users", () => {
     });
 
     assert.equal(d.allowed, true);
-    d.releaseConcurrency?.();
+    await d.releaseConcurrency?.();
   }
 
-  const blocked = engine.evaluate({
+  const blocked = await engine.evaluate({
     appId: "app-x",
     userId: "user-1",
     mailboxId: "mailbox-extra",
@@ -131,8 +266,7 @@ test("limits app+user independently from other users", () => {
   assert.equal(blocked.allowed, false);
   assert.equal(blocked.reason, "app_user_request_rate_exceeded");
 
-  // Different user should still be allowed at the same time.
-  const otherUser = engine.evaluate({
+  const otherUser = await engine.evaluate({
     appId: "app-x",
     userId: "user-2",
     mailboxId: "mailbox-other-user",
@@ -141,14 +275,14 @@ test("limits app+user independently from other users", () => {
   });
 
   assert.equal(otherUser.allowed, true);
-  otherUser.releaseConcurrency?.();
+  await otherUser.releaseConcurrency?.();
 });
 
-test("enforces 150MB upload budget per 5 minutes per mailbox", () => {
-  const engine = new RateLimitEngine();
+test("enforces 150MB upload budget per 5 minutes per mailbox", async () => {
+  const engine = createEngine();
   const t0 = 100_000;
 
-  const first = engine.evaluate({
+  const first = await engine.evaluate({
     appId: "app",
     userId: "user",
     mailboxId: "mailbox-4",
@@ -157,9 +291,9 @@ test("enforces 150MB upload budget per 5 minutes per mailbox", () => {
     timestampMs: t0
   });
   assert.equal(first.allowed, true);
-  first.releaseConcurrency?.();
+  await first.releaseConcurrency?.();
 
-  const second = engine.evaluate({
+  const second = await engine.evaluate({
     appId: "app",
     userId: "user",
     mailboxId: "mailbox-4",
@@ -171,4 +305,3 @@ test("enforces 150MB upload budget per 5 minutes per mailbox", () => {
   assert.equal(second.allowed, false);
   assert.equal(second.reason, "mailbox_upload_bandwidth_exceeded");
 });
-

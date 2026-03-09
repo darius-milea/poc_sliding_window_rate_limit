@@ -1,5 +1,5 @@
 import { LIMITS, WINDOWS } from "./limits";
-import { AsyncLimitDecision, RateLimitEngineOptions, RateLimitRequest } from "./types";
+import { AsyncLimitDecision, RateLimitRequest, SharedRateLimitOptions } from "./types";
 
 /**
  * Redis sorted set entry returned by zRangeWithScores.
@@ -94,7 +94,7 @@ export interface RedisClientLike {
 /**
  * Runtime options for the distributed Redis-backed limiter.
  */
-export interface RedisRateLimitEngineOptions extends RateLimitEngineOptions {
+export interface RedisRateLimitEngineOptions extends SharedRateLimitOptions {
   /** Key namespace prefix used for all Redis keys created by this engine. */
   redisKeyPrefix?: string;
 

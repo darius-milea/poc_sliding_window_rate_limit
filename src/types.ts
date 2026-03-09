@@ -18,21 +18,12 @@ export interface RateLimitRequest {
   timestampMs?: number;
 }
 
-export interface RateLimitEngineOptions {
+export interface SharedRateLimitOptions {
   // If true, per-message recipient cap increases from 500 to 1000.
   allowUpTo1000RecipientsPerMessage?: boolean;
 
   // Optional custom clock for tests.
   nowMs?: () => number;
-}
-
-export interface LimitDecision {
-  allowed: boolean;
-  reason: string;
-  retryAfterMs: number;
-
-  // Must be called after an accepted request completes so concurrency is released.
-  releaseConcurrency?: () => void;
 }
 
 export interface AsyncLimitDecision {
