@@ -441,7 +441,7 @@ export class RedisRateLimitEngine {
     }
 
     const retryAfterMs = oldest[0].score + windowMs - nowMs;
-    return retryAfterMs > 0 ? retryAfterMs : 0;
+    return Math.max(retryAfterMs, 0);
   }
 
   /**
